@@ -1,0 +1,3 @@
+#!/bin/zsh
+
+/usr/local/munki/Python.framework/Versions/Current/bin/python3 -m pip install azure-storage-blob

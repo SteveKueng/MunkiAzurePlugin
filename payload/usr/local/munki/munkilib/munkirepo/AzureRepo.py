@@ -80,6 +80,11 @@ class AzureRepo(Repo):
     def _connect(self):
         '''connect to the repo. Prompt for credentials if necessary.'''
         sas_token = get_pref('sas_token')
+
+        if not sas_token:
+            # get token from environment
+            sas_token = os.getenv('SAS_TOKEN')
+        
         if not sas_token:
             print('Please provide credentials for %s:' % self.baseurl)
             sas_token = get_input('SAS Token: ')

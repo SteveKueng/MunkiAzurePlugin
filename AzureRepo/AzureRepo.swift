@@ -136,11 +136,88 @@ class AzureRepo: Repo {
         }
     }
 
-    /// Stores a local file as an item in the repository
+    /// Stores a local file as an item in the repository.
+    /// Files larger than 4 GB are uploaded using Azure Block Blob API in 100 MB chunks.
     func put(_ identifier: String, fromFile local_file_path: String) async throws {
-        let fileURL = URL(fileURLWithPath: local_file_path)
-        let data = try Data(contentsOf: fileURL)
-        try await put(identifier, content: data)
+        let attributes = try FileManager.default.attributesOfItem(atPath: local_file_path)
+        let fileSize = attributes[.size] as? Int ?? 0
+
+        // Single PUT works up to ~5 GB; use block upload for anything above 4 GB
+        if fileSize <= 4 * 1024 * 1024 * 1024 {
+            let fileURL = URL(fileURLWithPath: local_file_path)
+            let data = try Data(contentsOf: fileURL)
+            try await put(identifier, content: data)
+            return
+        }
+
+        try await putLargeFile(identifier, filePath: local_file_path, fileSize: fileSize)
+    }
+
+    /// Block size for chunked uploads (100 MB)
+    private static let blockSize = 100 * 1024 * 1024
+
+    /// Uploads a large file using Azure Block Blob API (Put Block + Put Block List).
+    /// Streams the file in 100 MB chunks to avoid loading it entirely into memory.
+    private func putLargeFile(_ identifier: String, filePath: String, fileSize: Int) async throws {
+        let containerName = baseURL.lastPathComponent
+        let storageBase = baseURL.deletingLastPathComponent().absoluteString
+        let blobEndpoint = storageBase + containerName + "/" + identifier
+
+        guard let fileHandle = FileHandle(forReadingAtPath: filePath) else {
+            throw AzureRepoError("Cannot open file \(filePath)")
+        }
+        defer { fileHandle.closeFile() }
+
+        let blockSize = AzureRepo.blockSize
+        let blockCount = (fileSize + blockSize - 1) / blockSize
+        var blockIDs: [String] = []
+
+        for i in 0..<blockCount {
+            let blockID = String(format: "%06d", i)
+            let blockIDEncoded = Data(blockID.utf8).base64EncodedString()
+            blockIDs.append(blockIDEncoded)
+
+            let blockData = fileHandle.readData(ofLength: blockSize)
+
+            let blockURL = blobEndpoint + "&comp=block&blockid=" + blockIDEncoded
+            let urlString = buildAzureStorageURL(blockURL, sas: sasToken)
+            guard let url = URL(string: urlString) else {
+                throw AzureRepoError("Invalid Azure Storage URL for block \(i)")
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = "PUT"
+            request.setValue("\(blockData.count)", forHTTPHeaderField: "Content-Length")
+            request.httpBody = blockData
+
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                throw AzureRepoError("Azure Storage put block \(i + 1)/\(blockCount) failed (HTTP \(code)) for \(identifier)")
+            }
+            print("Uploaded block \(i + 1)/\(blockCount) for \(identifier)")
+        }
+
+        // Commit all blocks with Put Block List
+        let blockListXML = "<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>"
+            + blockIDs.map { "<Latest>\($0)</Latest>" }.joined()
+            + "</BlockList>"
+
+        let commitURL = blobEndpoint + "&comp=blocklist"
+        let commitURLString = buildAzureStorageURL(commitURL, sas: sasToken)
+        guard let url = URL(string: commitURLString) else {
+            throw AzureRepoError("Invalid Azure Storage URL for block list commit")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/xml", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(blockListXML.utf8)
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw AzureRepoError("Azure Storage put block list failed (HTTP \(code)) for \(identifier)")
+        }
+        print("Successfully uploaded \(identifier) (\(blockCount) blocks)")
     }
 
     /// Deletes an item in the repository
